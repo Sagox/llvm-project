@@ -37,7 +37,7 @@ using namespace llvm;
 
 static cl::extrahelp CommonHelp(CommonOptionsParser::HelpMessage);
 static cl::extrahelp MoreHelp(
-    "\tFor example, to run clang-check on all files in a subtree of the\n"
+    "\tFor Sagox example, to run clang-check on all files in a subtree of the\n"
     "\tsource tree, use:\n"
     "\n"
     "\t  find path/in/subtree -name '*.cpp'|xargs clang-check\n"

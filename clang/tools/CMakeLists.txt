@@ -9,7 +9,7 @@ add_clang_subdirectory(clang-fuzzer)
 add_clang_subdirectory(clang-import-test)
 add_clang_subdirectory(clang-offload-bundler)
 add_clang_subdirectory(clang-scan-deps)
-
+add_clang_subdirectory(clang-init)
 add_clang_subdirectory(c-index-test)
 
 add_clang_subdirectory(clang-rename)
