@@ -64,6 +64,9 @@
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/CodeMoverUtils.h"
+#include <algorithm>
+#include <unordered_set>
+#include <vector>
 
 using namespace llvm;
 
@@ -303,7 +306,6 @@ struct FusionCandidate {
 
       return false;
     }
-
     // Require ScalarEvolution to be able to determine a trip count.
     if (!SE.hasLoopInvariantBackedgeTakenCount(L)) {
       LLVM_DEBUG(dbgs() << "Loop " << L->getName()
@@ -526,7 +528,104 @@ public:
   /// This is the main entry point for loop fusion. It will traverse the
   /// specified function and collect candidate loops to fuse, starting at the
   /// outermost nesting level and working inwards.
+
+  std::vector<std::vector<FusionCandidate>>
+  getFusionCandidateVectors(LoopVector &LV) {
+    FusionCandidateCollection FCs;
+    for (Loop *L : LV) {
+      FusionCandidate CurrCand(L, &DT, &PDT, ORE);
+      if (!CurrCand.isEligibleForFusion(SE))
+        continue;
+      bool FoundSet = false;
+
+      for (auto &CurrCandSet : FCs) {
+        if (isControlFlowEquivalent(*CurrCandSet.begin(), CurrCand)) {
+          CurrCandSet.insert(CurrCand);
+          FoundSet = true;
+          break;
+        }
+      }
+      if (!FoundSet) {
+        FusionCandidateSet NewCandSet;
+        NewCandSet.insert(CurrCand);
+        FCs.push_back(NewCandSet);
+      }
+    }
+    std::vector<std::vector<FusionCandidate>> fusionCandidateVectors;
+    for (auto &CurrCandSet : FCs) {
+      fusionCandidateVectors.push_back(
+          std::vector<FusionCandidate>(CurrCandSet.begin(), CurrCandSet.end()));
+    }
+    return fusionCandidateVectors;
+  }
+
+  // std::vector<FusionCandidate> getFusionCandidateVector(LoopVector &LV) {
+  //   std::set<FusionCandidate, FusionCandidateCompare> fusionCandSet;
+  //   for(Loop *L : LV) {
+  //     fusionCandSet.insert(FusionCandidate(L, &DT, &PDT, ORE));
+  //   }
+  //   return std::vector<FusionCandidate>(fusionCandSet.begin(),
+  //   fusionCandSet.end());
+  // }
+
   bool fuseLoops(Function &F) {
+    LoopDepthTree LDTDuplicate(LI);
+    while (!LDTDuplicate.empty()) {
+      for (LoopVector &LV : LDTDuplicate) {
+        auto fusionCandidateVectors = getFusionCandidateVectors(LV);
+        for (auto fusionCandidateVector : fusionCandidateVectors) {
+          // auto fusionCandidateVector = getFusionCandidateVector(LV);
+          for (unsigned i = 0; i < fusionCandidateVector.size(); ++i) {
+            for (unsigned j = i + 1; j < fusionCandidateVector.size(); ++j) {
+              if (!fusionCandidateVector[i].isEligibleForFusion(SE) ||
+                  !fusionCandidateVector[j].isEligibleForFusion(SE))
+                continue;
+              if (!isControlFlowEquivalent(fusionCandidateVector[i],
+                                           fusionCandidateVector[j]))
+                continue;
+              if (isAdjacent(fusionCandidateVector[i],
+                             fusionCandidateVector[j]))
+                continue;
+              if (fusionCandidateVector[i].GuardBranch) {
+                if (fusionCandidateVector[j].GuardBranch) {
+                  if (!haveIdenticalGuards(fusionCandidateVector[i],
+                                           fusionCandidateVector[j])) {
+                    continue;
+                  } else {
+                    if (dependenciesAllowHoistingForGuarded(
+                            fusionCandidateVector[i],
+                            fusionCandidateVector[i].getNonLoopBlock(),
+                            fusionCandidateVector[j].getEntryBlock())) {
+                      hoistIntermediateRegionForGuardedLoops(
+                          fusionCandidateVector[i], fusionCandidateVector[j]);
+                      return true;
+                    }
+                  }
+                }
+              } else {
+                if (fusionCandidateVector[j].GuardBranch)
+                  continue;
+                if (dependenciesAllowHoisting(
+                        fusionCandidateVector[i],
+                        fusionCandidateVector[i].ExitBlock,
+                        fusionCandidateVector[j].getEntryBlock())) {
+                  hoistIntermediateRegion(fusionCandidateVector[i],
+                                          fusionCandidateVector[j]);
+                  fusionCandidateVector[i].L->verifyLoop();
+                  fusionCandidateVector[j].L->verifyLoop();
+                  return true;
+                }
+              }
+            }
+          }
+        }
+      }
+      LDTDuplicate.descend();
+    }
+    return false;
+  }
+
+  bool fuseLoopsUtil(Function &F) {
 #ifndef NDEBUG
     if (VerboseFusionDebugging) {
       LI.print(dbgs());
@@ -558,6 +657,8 @@ public:
 #endif
 
         collectFusionCandidates(LV);
+        // at this point FusionCandidates is a collection of sets of control
+        // flow equivalent loops
         Changed |= fuseCandidates();
       }
 
@@ -596,9 +697,9 @@ private:
   bool isControlFlowEquivalent(const FusionCandidate &FC0,
                                const FusionCandidate &FC1) const {
     assert(FC0.Preheader && FC1.Preheader && "Expecting valid preheaders");
-
-    return ::isControlFlowEquivalent(*FC0.getEntryBlock(), *FC1.getEntryBlock(),
-                                     DT, PDT);
+    bool result = ::isControlFlowEquivalent(*FC0.getEntryBlock(),
+                                            *FC1.getEntryBlock(), DT, PDT);
+    return result;
   }
 
   /// Iterate over all loops in the given loop set and identify the loops that
@@ -698,7 +799,6 @@ private:
     for (auto &CandidateSet : FusionCandidates) {
       if (CandidateSet.size() < 2)
         continue;
-
       LLVM_DEBUG(dbgs() << "Attempting fusion on Candidate Set:\n"
                         << CandidateSet << "\n");
 
@@ -709,13 +809,11 @@ private:
         for (++FC1; FC1 != CandidateSet.end(); ++FC1) {
           assert(!LDT.isRemovedLoop(FC1->L) &&
                  "Should not have removed loops in CandidateSet!");
-
           LLVM_DEBUG(dbgs() << "Attempting to fuse candidate \n"; FC0->dump();
                      dbgs() << " with\n"; FC1->dump(); dbgs() << "\n");
 
           FC0->verify();
           FC1->verify();
-
           if (!identicalTripCounts(*FC0, *FC1)) {
             LLVM_DEBUG(dbgs() << "Fusion candidates do not have identical trip "
                                  "counts. Not fusing.\n");
@@ -723,13 +821,15 @@ private:
                                                        NonEqualTripCount);
             continue;
           }
-
           if (!isAdjacent(*FC0, *FC1)) {
             LLVM_DEBUG(dbgs()
                        << "Fusion candidates are not adjacent. Not fusing.\n");
             reportLoopFusion<OptimizationRemarkMissed>(*FC0, *FC1, NonAdjacent);
             continue;
           }
+
+          // FC0->L->dump();
+          // FC1->L->dump();
 
           // Ensure that FC0 and FC1 have identical guards.
           // If one (or both) are not guarded, this check is not necessary.
@@ -1035,6 +1135,23 @@ private:
     return true;
   }
 
+  int getInstructionsInBetweenBlocks(
+      BasicBlock *B1, BasicBlock *B2,
+      std::unordered_set<BasicBlock *> &visited) const {
+    if (visited.find(B1) != visited.end())
+      return 0;
+    visited.insert(B1);
+    int numberOfInstructionsBetweenTheBlocks = B1->size();
+    if (B1 == B2)
+      return numberOfInstructionsBetweenTheBlocks;
+    auto terminatorInstruction = B1->getTerminator();
+    for (unsigned i = 0; i < terminatorInstruction->getNumSuccessors(); i++) {
+      numberOfInstructionsBetweenTheBlocks += getInstructionsInBetweenBlocks(
+          terminatorInstruction->getSuccessor(i), B2, visited);
+    }
+    return numberOfInstructionsBetweenTheBlocks;
+  }
+
   /// Determine if two fusion candidates are adjacent in the CFG.
   ///
   /// This method will determine if there are additional basic blocks in the CFG
@@ -1044,13 +1161,264 @@ private:
   /// FC1. If not, then the loops are not adjacent. If the two candidates are
   /// not guarded loops, then it checks whether the exit block of \p FC0 is the
   /// preheader of \p FC1.
-  bool isAdjacent(const FusionCandidate &FC0,
-                  const FusionCandidate &FC1) const {
-    // If the successor of the guard branch is FC1, then the loops are adjacent
-    if (FC0.GuardBranch)
+
+  // void getInstructionsInBetween(BasicBlock *B1, BasicBlock *B2) {
+
+  // }
+
+  void getReadAndWritesVectorOfRegionDFSUtil(
+      BasicBlock *B1, BasicBlock *B2,
+      llvm::SmallVector<llvm::Instruction *, 16> &readsVector,
+      llvm::SmallVector<llvm::Instruction *, 16> &writesVector,
+      llvm::SmallVector<llvm::Instruction *, 16> &instVec,
+      std::unordered_set<BasicBlock *> &visited, bool includeLastBlock) const {
+    if (!includeLastBlock && B1 == B2)
+      return;
+    if (visited.find(B1) != visited.end())
+      return;
+    visited.insert(B1);
+    for (auto I = B1->begin(); I != B1->end(); ++I) {
+      if (I->mayWriteToMemory())
+        writesVector.push_back(&*I);
+      if (I->mayReadFromMemory())
+        readsVector.push_back(&*I);
+      instVec.push_back(&*I);
+    }
+    if (B1 == B2)
+      return;
+    auto terminatorInstruction = B1->getTerminator();
+    for (unsigned i = 0; i < terminatorInstruction->getNumSuccessors(); i++) {
+      getReadAndWritesVectorOfRegionDFSUtil(
+          terminatorInstruction->getSuccessor(i), B2, readsVector, writesVector,
+          instVec, visited, includeLastBlock);
+    }
+  }
+
+  void getReadAndWritesVectorOfRegion(
+      BasicBlock *B1, BasicBlock *B2,
+      llvm::SmallVector<llvm::Instruction *, 16> &readsVector,
+      llvm::SmallVector<llvm::Instruction *, 16> &writesVector,
+      llvm::SmallVector<llvm::Instruction *, 16> &instVec,
+      bool includeLastBlock) const {
+    std::unordered_set<BasicBlock *> visited;
+    getReadAndWritesVectorOfRegionDFSUtil(B1, B2, readsVector, writesVector,
+                                          instVec, visited, includeLastBlock);
+  }
+
+  void collectReadsAndWritesFromBlock(
+      BasicBlock *B1, llvm::SmallVector<llvm::Instruction *, 16> &readsVector,
+      llvm::SmallVector<llvm::Instruction *, 16> &writesVector) {
+    for (auto I = B1->begin(); I != B1->end(); ++I) {
+      if (I->mayWriteToMemory())
+        writesVector.push_back(&*I);
+      if (I->mayReadFromMemory())
+        readsVector.push_back(&*I);
+    }
+  }
+
+  // the region would be moving over the guard block of FC0
+  // the blocks that were earlier above the regiona and would now be
+  // below are: the loop blocks, the loop preheader, loop guard and
+  // the loop exit block. We check if any of the instructions in these
+  // blocks is related to any instruction in the region
+  bool dependenciesAllowHoistingForGuarded(FusionCandidate &FC0, BasicBlock *B1,
+                                           BasicBlock *B2) {
+    llvm::SmallVector<llvm::Instruction *, 16> regionReads, regionWrites,
+        regionInsts, LoopReads = FC0.MemReads, LoopWrites = FC0.MemWrites;
+    getReadAndWritesVectorOfRegion(B1, B2, regionReads, regionWrites,
+                                   regionInsts, false);
+    collectReadsAndWritesFromBlock(FC0.ExitBlock, LoopReads, LoopWrites);
+    collectReadsAndWritesFromBlock(FC0.Preheader, LoopReads, LoopWrites);
+    collectReadsAndWritesFromBlock(FC0.getEntryBlock(), LoopReads, LoopWrites);
+    for (Instruction *WriteR : regionWrites) {
+      for (Instruction *WriteL : LoopWrites) {
+        auto DepResult = DI.depends(WriteR, WriteL, true);
+        if (DepResult)
+          return false;
+      }
+      for (Instruction *ReadL : LoopReads) {
+        auto DepResult = DI.depends(WriteR, ReadL, true);
+        if (DepResult)
+          return false;
+      }
+    }
+    for (Instruction *WriteL : LoopWrites) {
+      for (Instruction *WriteR : regionWrites) {
+        auto DepResult = DI.depends(WriteL, WriteR, true);
+        if (DepResult)
+          return false;
+      }
+      for (Instruction *ReadR : regionReads) {
+        auto DepResult = DI.depends(WriteL, ReadR, true);
+        if (DepResult)
+          return false;
+      }
+    }
+    for (Instruction *I : regionInsts) {
+      for (auto &Op : I->operands()) {
+        if (Instruction *Def = dyn_cast<Instruction>(Op)) {
+          if (FC0.L->contains(Def->getParent()) ||
+              (Def->getParent() == FC0.ExitBlock) ||
+              (Def->getParent() == FC0.Preheader) ||
+              (Def->getParent() == FC0.getEntryBlock())) {
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  bool dependenciesAllowHoisting(FusionCandidate &FC0, BasicBlock *B1,
+                                 BasicBlock *B2) {
+    llvm::SmallVector<llvm::Instruction *, 16> regionReads, regionWrites,
+        regionInsts, LoopReads = FC0.MemReads, LoopWrites = FC0.MemWrites;
+    getReadAndWritesVectorOfRegion(B1, B2, regionReads, regionWrites,
+                                   regionInsts, true);
+    for (Instruction *WriteR : regionWrites) {
+      for (Instruction *WriteL : LoopWrites) {
+        auto DepResult = DI.depends(WriteR, WriteL, true);
+        if (DepResult)
+          return false;
+      }
+      for (Instruction *ReadL : LoopWrites) {
+        auto DepResult = DI.depends(WriteR, ReadL, true);
+        if (DepResult)
+          return false;
+      }
+    }
+    for (Instruction *WriteL : LoopWrites) {
+      for (Instruction *WriteR : regionWrites) {
+        auto DepResult = DI.depends(WriteL, WriteR, true);
+        if (DepResult)
+          return false;
+      }
+      for (Instruction *ReadR : regionReads) {
+        auto DepResult = DI.depends(WriteL, ReadR, true);
+        if (DepResult)
+          return false;
+      }
+    }
+
+    for (Instruction *I : regionInsts) {
+      for (auto &Op : I->operands()) {
+        if (Instruction *Def = dyn_cast<Instruction>(Op)) {
+          if (FC0.L->contains(Def->getParent())) {
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  // void switchBlockTerminatorOperands(
+  //     BasicBlock *B1, BasicBlock *B2, BasicBlock *B3,
+  //     SmallVector<DominatorTree::UpdateType, 8> &TreeUpdates) {
+  //   auto B1Terminator = B1->getTerminator();
+  //   for (unsigned i = 0; i < B1Terminator->getNumOperands(); ++i) {
+  //     auto currentOperand = B1Terminator->getOperand(i);
+  //     if (currentOperand == B2) {
+  //       B1Terminator->setOperand(i, B3);
+  //     }
+  //   }
+  //   TreeUpdates.emplace_back(
+  //       DominatorTree::UpdateType(DominatorTree::Delete, B1, B2));
+  //   TreeUpdates.emplace_back(
+  //       DominatorTree::UpdateType(DominatorTree::Insert, B1, B3));
+  // }
+  void switchBlockTerminatorOperands(
+      BasicBlock *blockToMakeChangeIn, BasicBlock *fromB, BasicBlock *toB,
+      SmallVector<DominatorTree::UpdateType, 8> &TreeUpdates) {
+    blockToMakeChangeIn->getTerminator()->replaceUsesOfWith(fromB, toB);
+    TreeUpdates.emplace_back(
+        DominatorTree::UpdateType(DominatorTree::Delete, blockToMakeChangeIn, fromB));
+    TreeUpdates.emplace_back(
+        DominatorTree::UpdateType(DominatorTree::Insert, blockToMakeChangeIn, toB));
+  }
+
+  void hoistIntermediateRegionForGuardedLoops(FusionCandidate &FC0,
+                                              FusionCandidate &FC1) {
+    auto regionFirstBlock = FC0.getNonLoopBlock();
+    Function *F = FC0.Header->getParent();
+    LLVMContext &context = F->getContext();
+    SmallVector<DominatorTree::UpdateType, 8> TreeUpdates;
+    auto newIntermediateBlock = BasicBlock::Create(context, "", F);
+    std::vector<BasicBlock *> predecessorsOfLoopOneGuard;
+    for (BasicBlock *Pred : predecessors(FC1.getEntryBlock())) {
+      predecessorsOfLoopOneGuard.push_back(Pred);
+    }
+    for (BasicBlock *Pred : predecessorsOfLoopOneGuard) {
+      switchBlockTerminatorOperands(Pred, FC1.getEntryBlock(),
+                                    newIntermediateBlock, TreeUpdates);
+      FC1.getEntryBlock()->replacePhiUsesWith(Pred, FC0.getEntryBlock());
+    }
+
+    regionFirstBlock->replacePhiUsesWith(FC0.getEntryBlock(), predecessorsOfLoopOneGuard[0]);
+    regionFirstBlock->replacePhiUsesWith(FC0.ExitBlock, predecessorsOfLoopOneGuard[0]);
+    switchBlockTerminatorOperands(FC0.getEntryBlock(), regionFirstBlock,
+                                  FC1.getEntryBlock(), TreeUpdates);
+    switchBlockTerminatorOperands(FC0.ExitBlock, regionFirstBlock,
+                                  FC1.getEntryBlock(), TreeUpdates);
+    std::vector<BasicBlock *> preds;
+    for (BasicBlock *Pred : predecessors(FC0.getEntryBlock())) {
+      preds.push_back(Pred);
+    }
+
+    for (BasicBlock *Pred : preds) {
+      switchBlockTerminatorOperands(Pred, FC0.getEntryBlock(), regionFirstBlock,
+                                    TreeUpdates);
+      FC0.getEntryBlock()->replacePhiUsesWith(Pred, newIntermediateBlock);
+    }
+
+    BranchInst::Create(FC0.getEntryBlock(), newIntermediateBlock);
+    TreeUpdates.emplace_back(DominatorTree::UpdateType(
+        DominatorTree::Insert, newIntermediateBlock, FC0.getEntryBlock()));
+    DTU.applyUpdates(TreeUpdates);
+    DTU.flush();
+    DT.verify();
+  }
+
+  void hoistIntermediateRegion(FusionCandidate &FC0, FusionCandidate &FC1) {
+    Loop *L1 = FC0.L, *L2 = FC1.L;
+    Function *F = FC0.Header->getParent();
+    auto loopOnePreheader = L1->getLoopPreheader(),
+         loopTwoPreheader = L2->getLoopPreheader(),
+         loopTwoHeader = L2->getHeader(), loopOneHeader = L1->getHeader(),
+         regionFirstBlock = L1->getExitBlock();
+    LLVMContext &context = F->getContext();
+    SmallVector<DominatorTree::UpdateType, 8> TreeUpdates;
+    auto newIntermediateBlock = BasicBlock::Create(context, "", F);
+    BranchInst::Create(loopTwoHeader, newIntermediateBlock);
+    // the exit block of the first loop is the beginning of the
+    std::vector<BasicBlock *> predecessorsOfExitBlock;
+    for (BasicBlock *Pred : predecessors(regionFirstBlock)) {
+      predecessorsOfExitBlock.push_back(Pred);
+    }
+    for (BasicBlock *Pred : predecessorsOfExitBlock) {
+      switchBlockTerminatorOperands(Pred, regionFirstBlock, newIntermediateBlock,
+                                    TreeUpdates);
+      regionFirstBlock->replacePhiUsesWith(Pred, loopOnePreheader);
+    }
+    switchBlockTerminatorOperands(loopOnePreheader, loopOneHeader, regionFirstBlock, TreeUpdates);
+    loopOneHeader->replacePhiUsesWith(loopOnePreheader, loopTwoPreheader);
+    switchBlockTerminatorOperands(loopTwoPreheader, loopTwoHeader, loopOneHeader, TreeUpdates);
+    loopTwoHeader->replacePhiUsesWith(loopTwoPreheader, newIntermediateBlock);
+    TreeUpdates.emplace_back(DominatorTree::UpdateType(
+        DominatorTree::Insert, newIntermediateBlock, loopTwoHeader));
+    LI.removeBlock(loopOnePreheader);
+    LI.removeBlock(loopTwoPreheader);
+    DTU.applyUpdates(TreeUpdates);
+    DTU.flush();
+    DT.verify();
+  }
+
+  bool isAdjacent(const FusionCandidate &FC0, const FusionCandidate &FC1) {
+    if (FC0.GuardBranch) {
       return FC0.getNonLoopBlock() == FC1.getEntryBlock();
-    else
+    } else {
       return FC0.ExitBlock == FC1.getEntryBlock();
+    }
   }
 
   /// Determine if two fusion candidates have identical guards
@@ -1603,10 +1971,10 @@ struct LoopFuseLegacy : public FunctionPass {
     AU.addRequired<OptimizationRemarkEmitterWrapperPass>();
     AU.addRequired<DependenceAnalysisWrapperPass>();
 
-    AU.addPreserved<ScalarEvolutionWrapperPass>();
-    AU.addPreserved<LoopInfoWrapperPass>();
-    AU.addPreserved<DominatorTreeWrapperPass>();
-    AU.addPreserved<PostDominatorTreeWrapperPass>();
+    // AU.addPreserved<ScalarEvolutionWrapperPass>();
+    // AU.addPreserved<LoopInfoWrapperPass>();
+    // AU.addPreserved<DominatorTreeWrapperPass>();
+    // AU.addPreserved<PostDominatorTreeWrapperPass>();
   }
 
   bool runOnFunction(Function &F) override {
@@ -1620,8 +1988,19 @@ struct LoopFuseLegacy : public FunctionPass {
     auto &ORE = getAnalysis<OptimizationRemarkEmitterWrapperPass>().getORE();
 
     const DataLayout &DL = F.getParent()->getDataLayout();
+
+    bool didHoist;
+
+  do {
     LoopFuser LF(LI, DT, DI, SE, PDT, ORE, DL);
-    return LF.fuseLoops(F);
+    LF.fuseLoopsUtil(F);
+    LoopFuser LF1(LI, DT, DI, SE, PDT, ORE, DL);
+  	didHoist = LF1.fuseLoops(F);
+  } while(didHoist);
+    dbgs() << "Fused: " << FuseCounter << '\n';
+    F.viewCFG();
+    bool result = true;
+    return result;
   }
 };
 } // namespace
@@ -1635,16 +2014,25 @@ PreservedAnalyses LoopFusePass::run(Function &F, FunctionAnalysisManager &AM) {
   auto &ORE = AM.getResult<OptimizationRemarkEmitterAnalysis>(F);
 
   const DataLayout &DL = F.getParent()->getDataLayout();
-  LoopFuser LF(LI, DT, DI, SE, PDT, ORE, DL);
-  bool Changed = LF.fuseLoops(F);
+  bool Changed = true;
+    bool didHoist;
+  do {
+    LoopFuser LF(LI, DT, DI, SE, PDT, ORE, DL);
+    // compute dominator tree and loop info
+    LF.fuseLoopsUtil(F);
+    LoopFuser LF1(LI, DT, DI, SE, PDT, ORE, DL);
+	didHoist = LF1.fuseLoops(F);
+  	// DT.recalculate(F);
+	// LI.analyze(DT);
+  } while(didHoist);
+  dbgs() << "Fused: " << FuseCounter << '\n';
   if (!Changed)
     return PreservedAnalyses::all();
-
   PreservedAnalyses PA;
-  PA.preserve<DominatorTreeAnalysis>();
-  PA.preserve<PostDominatorTreeAnalysis>();
-  PA.preserve<ScalarEvolutionAnalysis>();
-  PA.preserve<LoopAnalysis>();
+  // PA.preserve<DominatorTreeAnalysis>();
+  // PA.preserve<PostDominatorTreeAnalysis>();
+  // PA.preserve<ScalarEvolutionAnalysis>();
+  // PA.preserve<LoopAnalysis>();
   return PA;
 }
 
